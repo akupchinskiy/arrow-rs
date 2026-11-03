@@ -686,7 +686,7 @@ where
     // bitmap, 64 slots per word. A rounded product below 2^52 converts through `i64` without
     // branches; for precision <= 15 every larger product (and NaN) is out of range anyway.
     let words = len.div_ceil(64);
-    let mut values: Vec<D::Native> = vec![D::Native::default(); len];
+    let mut values: Vec<D::Native> = Vec::with_capacity(len);
     let mut valid: Vec<u64> = vec![0; words];
     if precision <= 15 {
         let max_f = (10_i64.pow(precision as u32) - 1) as f64;
@@ -730,24 +730,23 @@ where
         .map(|a| Arc::new(a) as ArrayRef)
 }
 
-/// `kernel` on `round(x * mul)` of every input, 64 at a time, into `values` and one word per 64
-/// inputs of the `valid` bitmap. A separate function over plain slices, so that the loop holds
+/// `kernel` on `round(x * mul)` of every input, 64 at a time, appended to `values` (written
+/// once, without zeroing it first), and one word per 64 inputs of the `valid` bitmap. A separate function over plain slices, so that the loop holds
 /// its invariants and bit accumulator in registers; kernels without branches vectorize.
 #[inline(never)]
-fn kernel_pass<T, N, K>(inputs: &[T], values: &mut [N], valid: &mut [u64], mul: f64, kernel: K)
+fn kernel_pass<T, N, K>(inputs: &[T], values: &mut Vec<N>, valid: &mut [u64], mul: f64, kernel: K)
 where
     T: AsPrimitive<f64>,
     K: Fn(f64) -> (N, bool),
 {
-    let chunks = inputs.chunks(64).zip(values.chunks_mut(64));
-    for ((inputs, values), valid) in chunks.zip(valid.iter_mut()) {
+    for (inputs, valid) in inputs.chunks(64).zip(valid.iter_mut()) {
         let mut valid_bits = 0u64;
-        for (bit, (&input, value)) in inputs.iter().zip(values.iter_mut()).enumerate() {
+        values.extend(inputs.iter().enumerate().map(|(bit, &input)| {
             let x: f64 = input.as_();
             let (n, is_valid) = kernel((mul * x).round());
             valid_bits |= (is_valid as u64) << bit;
-            *value = n;
-        }
+            n
+        }));
         *valid = valid_bits;
     }
 }
