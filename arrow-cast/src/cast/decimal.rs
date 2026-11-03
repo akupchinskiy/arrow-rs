@@ -17,6 +17,7 @@
 
 use crate::cast::*;
 use crate::parse::{DecimalParseError, parse_decimal_checked};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 
 /// A utility trait that provides checked conversions between
 /// decimal types inspired by [`NumCast`]
@@ -672,30 +673,130 @@ pub(crate) fn cast_floating_point_to_decimal<T: ArrowPrimitiveType, D>(
 where
     <T as ArrowPrimitiveType>::Native: AsPrimitive<f64>,
     D: DecimalType + ArrowPrimitiveType,
-    <D as ArrowPrimitiveType>::Native: DecimalCast,
+    <D as ArrowPrimitiveType>::Native: DecimalCast + NativeFromI64,
 {
     validate_decimal_precision_and_scale::<D>(precision, scale)?;
-    let mul = 10_f64.powi(scale as i32);
+    let float_scale = FloatScale::new(scale);
+    let inputs = array.values();
+    let len = inputs.len();
+    let max = D::MAX_FOR_EACH_PRECISION[precision as usize];
+    let min = max.neg_wrapping();
 
-    if cast_options.safe {
-        array
-            .unary_opt::<_, D>(|v| float_to_decimal_checked::<D>(v.as_(), mul, precision).ok())
-            .with_precision_and_scale(precision, scale)
-            .map(|a| Arc::new(a) as ArrayRef)
-    } else {
-        array
-            .try_unary::<_, D, _>(|v| {
-                float_to_decimal_checked::<D>(v.as_(), mul, precision)
-                    .map_err(|e| e.into_arrow_error(v, precision, scale))
-            })?
-            .with_precision_and_scale(precision, scale)
-            .map(|a| Arc::new(a) as ArrayRef)
+    // Pass 1, over every slot (null slots too, with plain arithmetic and no calls): the fast
+    // path's value, and two bitmaps, `valid` (the value is the result) and `exact` (the slot
+    // needs the exact path). The kernels get the product `p` of the input `x` with 10^scale
+    // and return the value, `valid` and `not exact` (a negation per word is cheaper than one
+    // per lane); they capture their invariants by value.
+    let words = len.div_ceil(64);
+    let mut values: Vec<D::Native> = vec![D::Native::default(); len];
+    let mut valid: Vec<u64> = vec![0; words];
+    let mut exact: Vec<u64> = vec![0; words];
+    // 10^15 < 2^52, so for precision <= 15 every valid result is a rounded product that the
+    // fast path accepts, and the comparison with `max_f` also rejects NaN, infinities and
+    // products of 2^52 or more. A rejected product next to a half-integer needs the exact path
+    // only if its result, within 1 of the rounded product, can still be in range. Without
+    // branches, this kernel vectorizes. `!(a <= b)` rather than `a > b`: NaN is not exact.
+    let max_f = (10_i64.pow(precision.min(15) as u32) - 1) as f64;
+    #[expect(clippy::neg_cmp_op_on_partial_ord)]
+    let low = move |p: f64, _: f64| {
+        let (rounded, shortest) = fast_round(p);
+        let magnitude = rounded.abs();
+        (
+            D::Native::from_i64_wrapping(rounded as i64),
+            shortest & (magnitude <= max_f),
+            shortest | !(magnitude <= max_f + 1.0),
+        )
+    };
+    // From precision 16 on, every product below 2^52 is in range. An integer below 2^53 is its
+    // own shortest representation: for scale in 0..=22 its result is the exact i128 product,
+    // in range if |x| <= int_max.
+    let int_pow10 = usize::try_from(scale)
+        .ok()
+        .and_then(|s| POW10_I128.get(s))
+        .copied();
+    let int_max = match (int_pow10, max.to_i128()) {
+        (Some(pow10), Some(max)) => (max / pow10).min(1 << 53) as f64,
+        // 2^53 * 10^22 < 2^127 <= max
+        _ => 9_007_199_254_740_992.0,
+    };
+    let high = move |p: f64, x: f64| {
+        let (rounded, shortest) = fast_round(p);
+        if shortest {
+            (D::Native::from_i64_wrapping(rounded as i64), true, true)
+        } else {
+            (D::Native::default(), false, false)
+        }
+    };
+    match float_scale.pow10 {
+        Some(pow10) => match (scale >= 0, precision <= 15) {
+            (true, true) => {
+                fast_pass::<_, _, _, false>(inputs, &mut values, &mut valid, &mut exact, pow10, low)
+            }
+            (true, false) => fast_pass::<_, _, _, false>(
+                inputs,
+                &mut values,
+                &mut valid,
+                &mut exact,
+                pow10,
+                high,
+            ),
+            (false, true) => {
+                fast_pass::<_, _, _, true>(inputs, &mut values, &mut valid, &mut exact, pow10, low)
+            }
+            (false, false) => {
+                fast_pass::<_, _, _, true>(inputs, &mut values, &mut valid, &mut exact, pow10, high)
+            }
+        },
+        // |scale| > 22: every slot takes the exact path
+        None => exact.fill(u64::MAX),
     }
+
+    // Pass 2: the exact path for the slots that need it (rare: next to a half-integer, a
+    // product of 2^52 or more that is not a small integer, or |scale| > 22), skipping nulls.
+    let nulls = array.nulls();
+    let exact = BooleanBuffer::new(Buffer::from_vec(exact), 0, len);
+    let exact = match nulls {
+        Some(n) => &exact & n.inner(),
+        None => exact,
+    };
+    for i in exact.set_indices() {
+        let result = D::Native::from_f64((10_f64.powi(scale as i32) * { let x: f64 = inputs[i].as_(); x }).round())
+            .filter(|&n| n >= min && n <= max);
+        if let Some(n) = result {
+            values[i] = n;
+            valid[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    let valid = BooleanBuffer::new(Buffer::from_vec(valid), 0, len);
+    let valid = match nulls {
+        Some(n) => &valid & n.inner(),
+        None => valid,
+    };
+    if !cast_options.safe && valid.count_set_bits() != array.len() - array.null_count() {
+        // the first failing row's error, as the scalar function reports it
+        let i = (0..len)
+            .find(|&i| nulls.is_none_or(|n| n.is_valid(i)) && !valid.value(i))
+            .expect("a failing row");
+        let input: f64 = inputs[i].as_();
+        let error = match float_to_decimal_native::<D>(input, float_scale) {
+            Some(n) => FloatToDecimalError::<D>::PrecisionOverflow(n),
+            None => FloatToDecimalError::<D>::NativeOverflow,
+        };
+        return Err(error.into_arrow_error(inputs[i], precision, scale));
+    }
+    let nulls = NullBuffer::new(valid);
+    let nulls = (nulls.null_count() > 0).then_some(nulls);
+    PrimitiveArray::<D>::new(ScalarBuffer::from(values), nulls)
+        .with_precision_and_scale(precision, scale)
+        .map(|a| Arc::new(a) as ArrayRef)
 }
 
 /// Converts a floating point value to the unscaled integer representation of a decimal.
 ///
-/// Scales the input by `10^scale` and rounds half away from zero. Returns an error
+/// Scales the exact binary value of the input by `10^scale` and rounds half away from zero. For
+/// example, `295161.0` at scale 15 gives `295161 * 10^15`, and `1.005` (the double
+/// `1.00499999999999989…`) at scale 2 gives `100`. Returns an error
 /// if the precision or scale is invalid, or the result does not fit the native
 /// type or the requested precision. Non-finite inputs are rejected.
 /// Use [`float_to_decimal_opt`] when the reason for failure is not needed.
@@ -714,7 +815,7 @@ where
     D::Native: DecimalCast,
 {
     validate_decimal_precision_and_scale::<D>(precision, scale)?;
-    float_to_decimal_checked::<D>(input, 10_f64.powi(scale as i32), precision)
+    float_to_decimal_checked::<D>(input, FloatScale::new(scale), precision)
         .map_err(|e| e.into_arrow_error(input, precision, scale))
 }
 
@@ -734,7 +835,7 @@ where
     D::Native: DecimalCast,
 {
     validate_decimal_precision_and_scale::<D>(precision, scale).ok()?;
-    float_to_decimal_checked::<D>(input, 10_f64.powi(scale as i32), precision).ok()
+    float_to_decimal_checked::<D>(input, FloatScale::new(scale), precision).ok()
 }
 
 // Keep failure reporting allocation-free for scalar Option and safe array casts.
@@ -760,11 +861,11 @@ impl<D: DecimalType> FloatToDecimalError<D> {
     }
 }
 
-// `mul` is precomputed once for array casts. Precision must already be validated.
-#[inline]
+// Precision and scale must already be validated.
+#[inline(always)]
 fn float_to_decimal_checked<D>(
     input: f64,
-    mul: f64,
+    scale: FloatScale,
     precision: u8,
 ) -> Result<D::Native, FloatToDecimalError<D>>
 where
@@ -772,11 +873,279 @@ where
     D::Native: DecimalCast,
 {
     let value =
-        D::Native::from_f64((mul * input).round()).ok_or(FloatToDecimalError::NativeOverflow)?;
+        float_to_decimal_native::<D>(input, scale).ok_or(FloatToDecimalError::NativeOverflow)?;
     if D::is_valid_decimal_precision(value, precision) {
         Ok(value)
     } else {
         Err(FloatToDecimalError::PrecisionOverflow(value))
+    }
+}
+
+/// What [`float_to_decimal_native`] needs to know about a scale, computed once per array.
+#[derive(Clone, Copy)]
+struct FloatScale {
+    scale: i8,
+    /// `10^|scale|` if it is exact in `f64` (`|scale| <= 22`)
+    pow10: Option<f64>,
+}
+
+impl FloatScale {
+    #[inline]
+    fn new(scale: i8) -> Self {
+        Self {
+            scale,
+            pow10: POW10_I128
+                .get(scale.unsigned_abs() as usize)
+                .map(|&p| p as f64),
+        }
+    }
+}
+
+/// The fast path: `input * 10^scale` in floating point, rounded, and whether that is the result
+/// for the shortest decimal representation `d` of `input`; see [`fast_round`].
+#[inline(always)]
+fn fast_shortest_scaled(input: f64, scale: FloatScale) -> (f64, bool) {
+    match scale.pow10 {
+        Some(pow10) => fast_round(scale_product::<false>(input, pow10, scale.scale < 0)),
+        None => (0.0, false),
+    }
+}
+
+/// `x * 10^scale` as `x * pow10` or, for a negative scale, `x / pow10`, with `pow10 = 10^|scale|`.
+/// `DIV` is the sign of the scale when it is known at compile time (array loops), `divide`
+/// otherwise.
+#[inline(always)]
+fn scale_product<const DIV: bool>(x: f64, pow10: f64, divide: bool) -> f64 {
+    if DIV || divide { x / pow10 } else { x * pow10 }
+}
+
+/// The product `p` of an input `x` with 10^scale, rounded, and whether that is the result for the
+/// shortest decimal representation `d` of `x`. For |scale| <= 22, 10^|scale| is exact in f64, so
+/// `p` is the scaled input rounded once, within half an ulp of it; and `x` is within half an ulp
+/// of `d`. So `p`, `x * 10^scale` and `d * 10^scale` are within two ulps of `p` of each other and
+/// round alike unless a half-integer is that close to `p`. `margin` (2^-50 * |p|) is at least 4
+/// ulps, and above 0.5 for |p| >= 2^52, which rejects the values where `p - rounded` is not
+/// exact, and NaN and infinities.
+#[inline(always)]
+fn fast_round(p: f64) -> (f64, bool) {
+    let rounded = p.round();
+    (rounded, rounded.abs() < 4_503_599_627_370_496.0)
+}
+
+/// `input * 10^scale` rounded half away from zero, or `None` if `input` is not finite or the
+/// result does not fit `D::Native`.
+///
+/// Uses the floating-point product only when its error bound proves that it rounds to the
+/// same integer as the shortest decimal. Otherwise scales the shortest decimal digits exactly.
+#[inline(always)]
+fn float_to_decimal_native<D>(input: f64, scale: FloatScale) -> Option<D::Native>
+where
+    D: DecimalType,
+    D::Native: DecimalCast,
+{
+    let (rounded, shortest) = fast_shortest_scaled(input, scale);
+    if shortest {
+        // |rounded| < 2^52: exact as i64
+        return D::Native::from_decimal(rounded as i64);
+    }
+    exact_decimal_scaled(input, scale.scale).and_then(D::Native::from_decimal)
+}
+
+/// A decimal native from an `i64` without a range check: the array cast's first pass converts
+/// every slot, valid or not, and masks the invalid ones.
+pub(crate) trait NativeFromI64 {
+    fn from_i64_wrapping(v: i64) -> Self;
+}
+
+impl NativeFromI64 for i32 {
+    fn from_i64_wrapping(v: i64) -> Self {
+        v as i32
+    }
+}
+
+impl NativeFromI64 for i64 {
+    fn from_i64_wrapping(v: i64) -> Self {
+        v
+    }
+}
+
+impl NativeFromI64 for i128 {
+    fn from_i64_wrapping(v: i64) -> Self {
+        v as i128
+    }
+}
+
+impl NativeFromI64 for i256 {
+    fn from_i64_wrapping(v: i64) -> Self {
+        i256::from_i128(v as i128)
+    }
+}
+
+/// Pass 1 of the array cast: `kernel` on every input and its product with 10^scale (`x * pow10`,
+/// or `x / pow10` if `DIV`), 64 at a time, into `values` and one word per 64 inputs of the
+/// `valid` and `exact` bitmaps; the kernel returns the value, `valid` and `not exact`. A
+/// separate function over plain slices, so that the loop holds its invariants and bit
+/// accumulators in registers; kernels without branches vectorize.
+#[inline(never)]
+fn fast_pass<T, N, K, const DIV: bool>(
+    inputs: &[T],
+    values: &mut [N],
+    valid: &mut [u64],
+    exact: &mut [u64],
+    pow10: f64,
+    kernel: K,
+) where
+    T: AsPrimitive<f64>,
+    K: Fn(f64, f64) -> (N, bool, bool),
+{
+    let chunks = inputs.chunks(64).zip(values.chunks_mut(64));
+    for ((inputs, values), (valid, exact)) in chunks.zip(valid.iter_mut().zip(exact.iter_mut())) {
+        let (mut valid_bits, mut not_exact_bits) = (0u64, 0u64);
+        for (bit, (&input, value)) in inputs.iter().zip(values.iter_mut()).enumerate() {
+            let x: f64 = input.as_();
+            let (n, is_valid, not_exact) = kernel(scale_product::<DIV>(x, pow10, false), x);
+            valid_bits |= (is_valid as u64) << bit;
+            not_exact_bits |= (not_exact as u64) << bit;
+            *value = n;
+        }
+        *valid = valid_bits;
+        // the bits past a short last chunk stay clear
+        *exact = !not_exact_bits & (u64::MAX >> (64 - inputs.len()));
+    }
+}
+
+/// `10^i` for `i` in `0..=22`.
+const POW10_I128: [i128; 23] = {
+    let mut table = [1i128; 23];
+    let mut i = 1;
+    while i < table.len() {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
+/// Whether `v` is an integer below 2^53 in magnitude. Such an integer is its own shortest
+/// representation: its rounding interval is at most 1 wide and holds no other integer.
+#[inline(always)]
+fn is_small_integer(v: f64) -> bool {
+    v.abs() < 9_007_199_254_740_992.0 && v == v.trunc()
+}
+
+/// `5^i` for every `i` with `5^i < 2^128`.
+const POW5_U128: [u128; 56] = {
+    let mut table = [1u128; 56];
+    let mut i = 1;
+    while i < table.len() {
+        table[i] = table[i - 1] * 5;
+        i += 1;
+    }
+    table
+};
+
+/// The exact path: `round_half_away_from_zero(input * 10^scale)` of the exact binary value of
+/// `input`, in integer arithmetic, or `None` if `input` is not finite or the result does not fit
+/// `i256`. A finite `f64` is `m * 2^e` with an integer `m < 2^53`, so the result is
+/// `m * 5^scale * 2^(e + scale)`, rounded.
+#[inline(never)]
+fn exact_decimal_scaled(input: f64, scale: i8) -> Option<i256> {
+    if !input.is_finite() {
+        return None;
+    }
+    let bits = input.to_bits();
+    let negative = (bits >> 63) != 0;
+    let biased_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (m, e) = if biased_exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), biased_exponent - 1075)
+    };
+    if m == 0 {
+        return Some(i256::ZERO);
+    }
+    let zeros = m.trailing_zeros();
+    let (m, e) = (m >> zeros, e + zeros as i32);
+    let magnitude = match scaled_magnitude_u128(m, e, scale) {
+        Some(v) => i256::from_parts(v, 0),
+        None => scaled_magnitude_i256(m, e, scale)?,
+    };
+    Some(if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    })
+}
+
+/// `round_half_up(m * 5^scale * 2^(e + scale))` in `u128` for a non-negative scale, or `None` if
+/// an intermediate or the result does not fit (the caller then uses `i256`).
+#[inline]
+fn scaled_magnitude_u128(m: u64, e: i32, scale: i8) -> Option<u128> {
+    let pow5 = *POW5_U128.get(usize::try_from(scale).ok()?)?;
+    let p = (m as u128).checked_mul(pow5)?;
+    let shift = e + scale as i32;
+    if shift >= 0 {
+        let shift = shift as u32;
+        (shift <= p.leading_zeros()).then(|| p << shift)
+    } else {
+        let shift = shift.unsigned_abs();
+        Some(match shift {
+            // p < 2^128: p / 2^shift rounds to 1 only if p >= 2^127 and shift is 128
+            129.. => 0,
+            128 => p >> 127,
+            _ => (p >> shift) + ((p >> (shift - 1)) & 1),
+        })
+    }
+}
+
+/// [`scaled_magnitude_u128`] in `i256`, for any scale; `None` if the result does not fit `i256`
+/// or, for a negative scale, an intermediate does not.
+fn scaled_magnitude_i256(m: u64, e: i32, scale: i8) -> Option<i256> {
+    let m = i256::from_i128(m as i128);
+    if scale >= 0 {
+        // m < 2^53 and 5^76 < 2^177: no overflow for any valid scale
+        let p = m.checked_mul(i256::from_i128(5).checked_pow(scale as u32)?)?;
+        let shift = e + scale as i32;
+        if shift >= 0 {
+            let shift = shift as u32;
+            // the sign bit must stay clear
+            (shift < p.leading_zeros()).then(|| p << shift as u8)
+        } else {
+            let shift = shift.unsigned_abs();
+            Some(match shift {
+                // p < 2^255
+                256.. => i256::ZERO,
+                255 => p >> 254,
+                _ => {
+                    let shift = shift as u8;
+                    (p >> shift) + ((p >> (shift - 1)) & i256::ONE)
+                }
+            })
+        }
+    } else {
+        // m * 2^e / 10^k, rounded half up
+        let k = scale.unsigned_abs() as u32;
+        let ten_k = i256::from_i128(10).checked_pow(k)?;
+        let (numerator, denominator) = if e >= 0 {
+            let e = e as u32;
+            if e >= m.leading_zeros() {
+                return None;
+            }
+            (m << e as u8, ten_k)
+        } else {
+            let e = e.unsigned_abs();
+            match (e < ten_k.leading_zeros()).then(|| ten_k << e as u8) {
+                Some(d) => (m, d),
+                // the denominator is above 2^255 > 2 * m
+                None => return Some(i256::ZERO),
+            }
+        };
+        let (q, r) = numerator.checked_div_rem(denominator)?;
+        Some(if r >= denominator - r {
+            q + i256::ONE
+        } else {
+            q
+        })
     }
 }
 
@@ -1113,7 +1482,7 @@ pub(crate) fn cast_to_decimal<D, M>(
 ) -> Result<ArrayRef, ArrowError>
 where
     D: DecimalType + ArrowPrimitiveType<Native = M>,
-    M: ArrowNativeTypeOp + DecimalCast,
+    M: ArrowNativeTypeOp + DecimalCast + NativeFromI64,
 {
     use DataType::*;
     // cast data to decimal
@@ -1387,5 +1756,494 @@ mod tests {
     fn test_rescale_decimal_invalid_output_precision_scale_returns_none() {
         let result = rescale_decimal::<Decimal128Type, Decimal128Type>(123_i128, 38, 38, 39, 39);
         assert_eq!(result, None);
+    }
+
+    /// Reference: the exact decimal expansion of `input` (`{:.1100}` prints every digit of a
+    /// finite `f64`), rounded half away from zero at `scale` digits; `None` if it does not fit
+    /// `i256`.
+    fn exact_scaled(input: f64, scale: i8) -> Option<i256> {
+        let text = format!("{:.1100}", input.abs());
+        let (int_part, frac_part) = text.split_once('.').unwrap();
+        let k = scale as i32;
+        let (kept, next): (String, u8) = if k >= 0 {
+            let k = k as usize;
+            (
+                format!("{int_part}{}", &frac_part[..k]),
+                frac_part.as_bytes()[k],
+            )
+        } else {
+            let cut = int_part.len() as i32 + k;
+            match cut.cmp(&0) {
+                std::cmp::Ordering::Less => ("0".to_string(), b'0'),
+                std::cmp::Ordering::Equal => ("0".to_string(), int_part.as_bytes()[0]),
+                std::cmp::Ordering::Greater => {
+                    let cut = cut as usize;
+                    (int_part[..cut].to_string(), int_part.as_bytes()[cut])
+                }
+            }
+        };
+        let mut value = i256::from_string(&kept)?;
+        if next >= b'5' {
+            value = value.checked_add(i256::ONE)?;
+        }
+        Some(if input < 0.0 {
+            value.wrapping_neg()
+        } else {
+            value
+        })
+    }
+
+    /// Below 2^53 the floating-point product, rounded, as before; from 2^53 on the reference.
+    fn check_float_to_decimal<D>(input: f64, scale: i8)
+    where
+        D: DecimalType,
+        D::Native: DecimalCast + std::fmt::Debug + PartialEq,
+    {
+        let expected = if input.is_finite() {
+            exact_scaled(input, scale).and_then(D::Native::from_decimal)
+        } else {
+            None
+        };
+        let actual = float_to_decimal_native::<D>(input, FloatScale::new(scale));
+        assert_eq!(actual, expected, "input {input:e} scale {scale}");
+    }
+
+    #[test]
+    fn test_float_to_decimal_large_products() {
+        // from 2^53 on, the floating-point product is inexact: 295161.0 at scale 15 gave
+        // 295160999999999967232
+        assert_eq!(
+            float_to_decimal::<Decimal128Type>(295161.0, 31, 15).unwrap(),
+            295161 * 10_i128.pow(15)
+        );
+        assert_eq!(
+            float_to_decimal::<Decimal128Type>(123456789.0, 38, 20).unwrap(),
+            123456789 * 10_i128.pow(20)
+        );
+        assert_eq!(
+            float_to_decimal::<Decimal128Type>(1234.56, 38, 20).unwrap(),
+            123455999999999994543032
+        );
+        assert_eq!(
+            float_to_decimal::<Decimal128Type>(-0.1, 38, 20).unwrap(),
+            -10000000000000000555
+        );
+        assert_eq!(
+            float_to_decimal::<Decimal256Type>(0.1, 76, 55).unwrap(),
+            i256::from_string("1000000000000000055511151231257827021181583404541015625").unwrap()
+        );
+        assert_eq!(
+            float_to_decimal::<Decimal256Type>(1.5e30, 40, 0).unwrap(),
+            // the double nearest to 1.5e30
+            i256::from_string("1499999999999999889089448902656").unwrap()
+        );
+        // next to a rounding boundary: the exact value (0.15 is 0.1499999999999999944...)
+        assert_eq!(
+            float_to_decimal::<Decimal64Type>(1.005, 10, 2).unwrap(),
+            100
+        );
+        assert_eq!(float_to_decimal::<Decimal64Type>(0.145, 10, 2).unwrap(), 14);
+        assert_eq!(
+            float_to_decimal::<Decimal64Type>(26.657349498176934, 18, 14).unwrap(),
+            2665734949817693
+        );
+        assert_eq!(
+            // the double nearest to 1.5e30 is 1.4999999999999998891e30
+            float_to_decimal::<Decimal256Type>(1.5e30, 10, -30).unwrap(),
+            i256::ONE
+        );
+        assert_eq!(float_to_decimal::<Decimal64Type>(0.15, 10, 1).unwrap(), 1);
+        assert_eq!(float_to_decimal::<Decimal64Type>(-2.5, 10, 0).unwrap(), -3);
+        assert_eq!(
+            float_to_decimal::<Decimal32Type>(12.345, 5, 2).unwrap(),
+            1235
+        );
+        assert_eq!(
+            float_to_decimal::<Decimal128Type>(123456.0, 10, -2).unwrap(),
+            1235
+        );
+        // tiny, huge and non-finite
+        assert_eq!(
+            float_to_decimal::<Decimal128Type>(5e-324, 38, 38).unwrap(),
+            0
+        );
+        assert_eq!(float_to_decimal::<Decimal128Type>(-0.0, 38, 2).unwrap(), 0);
+        assert!(float_to_decimal::<Decimal256Type>(f64::MAX, 76, 0).is_err());
+        assert!(float_to_decimal::<Decimal128Type>(f64::NAN, 38, 2).is_err());
+        assert!(float_to_decimal::<Decimal128Type>(f64::INFINITY, 38, 2).is_err());
+        assert!(float_to_decimal::<Decimal128Type>(1.7e38, 38, 0).is_err());
+        assert!(float_to_decimal_opt::<Decimal128Type>(1.7e38, 38, 0).is_none());
+    }
+
+    #[test]
+    fn test_float_to_decimal_matches_reference() {
+        // deterministic xorshift over sign, exponent and mantissa
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0;
+        for _ in 0..20_000 {
+            let r = next();
+            // exponents roughly from 2^-80 to 2^130: results from 0 to beyond i256
+            let exponent = 1023 - 80 + (r >> 53) % 210;
+            let input =
+                f64::from_bits((r & (1 << 63)) | (exponent << 52) | (next() & ((1 << 52) - 1)));
+            let scale = (next() % 120) as i8 - 40; // -40 ..= 79, clamped per type below
+            if (0..=9).contains(&scale) {
+                check_float_to_decimal::<Decimal32Type>(input, scale);
+            }
+            if (-20..=18).contains(&scale) {
+                check_float_to_decimal::<Decimal64Type>(input, scale);
+            }
+            if (-40..=38).contains(&scale) {
+                check_float_to_decimal::<Decimal128Type>(input, scale);
+            }
+            if scale <= 76 {
+                check_float_to_decimal::<Decimal256Type>(input, scale);
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 20_000);
+        // near rounding boundaries: (k + 0.5) / 10^s and its neighbouring doubles
+        for _ in 0..20_000 {
+            let s = (next() % 23) as i32;
+            let k = (next() % 1_000_000_000_000) as f64;
+            let base = (k + 0.5) / 10f64.powi(s);
+            let delta = (next() % 7) as i64 - 3;
+            let input = f64::from_bits((base.to_bits() as i64 + delta) as u64);
+            check_float_to_decimal::<Decimal128Type>(input, s as i8);
+            check_float_to_decimal::<Decimal128Type>(-input, s as i8);
+        }
+        // around the switch to the exact path: products near 2^53
+        for _ in 0..20_000 {
+            let s = (next() % 23) as i32;
+            let factor = 1.0 + ((next() % 2001) as f64 - 1000.0) * 1e-6;
+            let base = 9_007_199_254_740_992.0 * factor / 10f64.powi(s);
+            let delta = (next() % 7) as i64 - 3;
+            let input = f64::from_bits((base.to_bits() as i64 + delta) as u64);
+            check_float_to_decimal::<Decimal128Type>(input, s as i8);
+            check_float_to_decimal::<Decimal128Type>(-input, s as i8);
+        }
+        // integers and values with few binary digits, the common case
+        for v in [
+            1.0,
+            3.0,
+            99.99,
+            1234.5678,
+            295161.0,
+            1e15,
+            1e17,
+            123456789.125,
+        ] {
+            for scale in 0..=38 {
+                check_float_to_decimal::<Decimal128Type>(v, scale);
+                check_float_to_decimal::<Decimal128Type>(-v, scale);
+            }
+        }
+    }
+
+    #[test]
+    fn test_float_decimal_array_tails_and_integer_repairs() {
+        fn check<T: ArrowPrimitiveType, D: DecimalType>(array: &PrimitiveArray<T>)
+        where
+            T::Native: AsPrimitive<f64>,
+            D::Native: DecimalCast + NativeFromI64,
+        {
+            for scale in [-23, -22, -2, 0, 2, 15, 22] {
+                if scale > D::MAX_PRECISION as i8 {
+                    continue;
+                }
+                for offset in [0, 1, 9] {
+                    for len in [0, 1, 7, 63, 64, 127] {
+                        let array = array.slice(offset, len);
+                        let precision = D::MAX_PRECISION;
+                        let safe = cast_floating_point_to_decimal::<T, D>(
+                            &array,
+                            precision,
+                            scale,
+                            &CastOptions::default(),
+                        )
+                        .unwrap();
+                        let expected: Vec<_> = array
+                            .iter()
+                            .map(|v| float_to_decimal_opt::<D>(v?.as_(), precision, scale))
+                            .collect();
+                        assert_eq!(
+                            safe.as_primitive::<D>().iter().collect::<Vec<_>>(),
+                            expected
+                        );
+                        let strict = cast_floating_point_to_decimal::<T, D>(
+                            &array,
+                            precision,
+                            scale,
+                            &CastOptions {
+                                safe: false,
+                                ..Default::default()
+                            },
+                        );
+                        let first_error = array.iter().flatten().find_map(|v| {
+                            float_to_decimal_checked::<D>(
+                                v.as_(),
+                                FloatScale::new(scale),
+                                precision,
+                            )
+                            .map_err(|e| e.into_arrow_error(v, precision, scale))
+                            .err()
+                        });
+                        match (strict, first_error) {
+                            (Err(actual), Some(expected)) => {
+                                assert_eq!(actual.to_string(), expected.to_string())
+                            }
+                            (Ok(actual), None) => assert_eq!(actual.as_ref(), safe.as_ref()),
+                            (actual, expected) => panic!("{actual:?} vs {expected:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        let samples = [
+            0.0,
+            -0.0,
+            1.005,
+            -0.145,
+            295161.0,
+            -295161.0,
+            9_007_199_254_740_991.0,
+            9_007_199_254_740_992.0,
+            123.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::MAX,
+        ];
+        let values: Vec<_> = samples.into_iter().cycle().take(140).collect();
+        // Null slots retain nonzero and non-finite payloads; sliced arrays offset the bitmap.
+        let nulls = NullBuffer::new(BooleanBuffer::collect_bool(values.len(), |i| i % 11 != 0));
+        let narrow = Float32Array::new(
+            values.iter().map(|&v| v as f32).collect(),
+            Some(nulls.clone()),
+        );
+        let wide = Float64Array::new(values.into(), Some(nulls));
+        check::<_, Decimal32Type>(&narrow);
+        check::<_, Decimal64Type>(&narrow);
+        check::<_, Decimal128Type>(&narrow);
+        check::<_, Decimal256Type>(&narrow);
+        check::<_, Decimal32Type>(&wide);
+        check::<_, Decimal64Type>(&wide);
+        check::<_, Decimal128Type>(&wide);
+        check::<_, Decimal256Type>(&wide);
+    }
+
+    #[test]
+    fn test_low_precision_float_array_boundaries() {
+        fn check<D: DecimalType>()
+        where
+            D::Native: DecimalCast + NativeFromI64,
+        {
+            for precision in [1, D::MAX_PRECISION.min(15)] {
+                for scale in [-128, -20, -1, 0, 1, precision as i8] {
+                    let mul = 10_f64.powi(scale as i32);
+                    let max = (10_i64.pow(precision as u32) - 1) as f64;
+                    let samples = [
+                        None,
+                        Some(0.0),
+                        Some(-0.0),
+                        Some(max / mul),
+                        Some(-max / mul),
+                        Some((max + 0.5) / mul),
+                        Some((-max - 0.5) / mul),
+                        Some((max - 0.5) / mul),
+                        Some(f64::MAX),
+                        Some(f64::NAN),
+                        Some(f64::INFINITY),
+                        Some(f64::NEG_INFINITY),
+                    ];
+                    let array = Float64Array::from_iter(samples.into_iter().cycle().take(140));
+                    // Exercise nonzero bitmap offsets and different first failures.
+                    for offset in 0..samples.len() {
+                        let array = array.slice(offset, 100);
+                        let safe = cast_floating_point_to_decimal::<Float64Type, D>(
+                            &array,
+                            precision,
+                            scale,
+                            &CastOptions::default(),
+                        )
+                        .unwrap();
+                        let actual = safe.as_primitive::<D>();
+                        let expected = array
+                            .iter()
+                            .map(|v| float_to_decimal_opt::<D>(v?, precision, scale))
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual.iter().collect::<Vec<_>>(), expected);
+                        let strict = cast_floating_point_to_decimal::<Float64Type, D>(
+                            &array,
+                            precision,
+                            scale,
+                            &CastOptions {
+                                safe: false,
+                                ..Default::default()
+                            },
+                        );
+                        let first_error = array
+                            .iter()
+                            .flatten()
+                            .find_map(|v| float_to_decimal::<D>(v, precision, scale).err());
+                        match (strict, first_error) {
+                            (Err(actual), Some(expected)) => {
+                                assert_eq!(actual.to_string(), expected.to_string());
+                            }
+                            (Ok(actual), None) => assert_eq!(actual.as_ref(), safe.as_ref()),
+                            (actual, expected) => panic!("{actual:?} vs {expected:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        check::<Decimal32Type>();
+        check::<Decimal64Type>();
+        check::<Decimal128Type>();
+        check::<Decimal256Type>();
+    }
+
+    /// The array path's first pass takes a shortcut for integers below 2^53 from precision 16
+    /// on, with its own range bound: integers around that bound, around 2^53 and around the
+    /// largest valid product, at scales inside and outside the shortcut's range, must agree with
+    /// the scalar path in both modes.
+    #[test]
+    fn test_float_array_integer_shortcut_boundaries() {
+        fn check<D: DecimalType>(precision: u8, scale: i8)
+        where
+            D::Native: DecimalCast + NativeFromI64,
+        {
+            let max = D::MAX_FOR_EACH_PRECISION[precision as usize];
+            let int_max = match (usize::try_from(scale).ok(), max.to_i128()) {
+                (Some(s), Some(max)) if s < POW10_I128.len() => (max / POW10_I128[s]) as f64,
+                _ => 9_007_199_254_740_992.0,
+            };
+            let mut samples = vec![
+                None,
+                Some(0.0),
+                Some(1.0),
+                Some(-1.0),
+                Some(1.5),
+                Some(9_007_199_254_740_991.0),
+                Some(9_007_199_254_740_992.0),
+                Some(-9_007_199_254_740_992.0),
+                Some(f64::NAN),
+                Some(f64::MAX),
+            ];
+            for v in [int_max - 1.0, int_max, int_max + 1.0, int_max * 10.0] {
+                samples.push(Some(v));
+                samples.push(Some(-v));
+                samples.push(Some(v + 0.5));
+            }
+            let array = Float64Array::from_iter(samples.iter().cycle().take(150).copied());
+            for offset in [0, 3, 64] {
+                let array = array.slice(offset, 80);
+                let safe = cast_floating_point_to_decimal::<Float64Type, D>(
+                    &array,
+                    precision,
+                    scale,
+                    &CastOptions::default(),
+                )
+                .unwrap();
+                let expected = array
+                    .iter()
+                    .map(|v| float_to_decimal_opt::<D>(v?, precision, scale))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    safe.as_primitive::<D>().iter().collect::<Vec<_>>(),
+                    expected,
+                    "{} precision {precision} scale {scale} offset {offset}",
+                    D::PREFIX
+                );
+                let strict = cast_floating_point_to_decimal::<Float64Type, D>(
+                    &array,
+                    precision,
+                    scale,
+                    &CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                );
+                let first_error = array
+                    .iter()
+                    .flatten()
+                    .find_map(|v| float_to_decimal::<D>(v, precision, scale).err());
+                match (strict, first_error) {
+                    (Err(actual), Some(expected)) => {
+                        assert_eq!(actual.to_string(), expected.to_string());
+                    }
+                    (Ok(actual), None) => assert_eq!(actual.as_ref(), safe.as_ref()),
+                    (actual, expected) => panic!("{actual:?} vs {expected:?}"),
+                }
+            }
+        }
+        for scale in [-1, 0, 3, 15, 22, 23] {
+            for precision in [16, 18] {
+                if scale <= precision as i8 {
+                    check::<Decimal64Type>(precision, scale);
+                    check::<Decimal128Type>(precision, scale);
+                    check::<Decimal256Type>(precision, scale);
+                }
+            }
+            check::<Decimal128Type>(38, scale);
+            check::<Decimal256Type>(39, scale);
+            check::<Decimal256Type>(76, scale);
+        }
+    }
+
+    #[test]
+    fn test_cast_float_array_to_decimal_matches_scalar() {
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for &(precision, scale) in &[(38u8, 15i8), (38, 20), (20, 3), (12, 2), (38, -2), (15, 10)] {
+            for big_share in [0u64, 1, 50] {
+                let values: Vec<Option<f64>> = (0..1000)
+                    .map(|_| match next() % 100 {
+                        0..=4 => None,
+                        5 => Some(f64::NAN),
+                        6 => Some(f64::INFINITY),
+                        r if r < 7 + big_share => Some((next() % 1_000_000_000) as f64 * 1e7),
+                        _ => Some(((next() % 2_000_000) as f64 - 1e6) / 64.0),
+                    })
+                    .collect();
+                let array = Float64Array::from(values.clone());
+                let to_type = DataType::Decimal128(precision, scale);
+                // safe: element by element as float_to_decimal_opt
+                let safe = cast_with_options(&array, &to_type, &CastOptions::default()).unwrap();
+                let safe = safe.as_primitive::<Decimal128Type>();
+                for (i, v) in values.iter().enumerate() {
+                    let expected =
+                        v.and_then(|v| float_to_decimal_opt::<Decimal128Type>(v, precision, scale));
+                    assert_eq!(safe.is_valid(i).then(|| safe.value(i)), expected, "{v:?}");
+                }
+                // strict: the first failing element's error, or the same values
+                let strict_options = CastOptions {
+                    safe: false,
+                    ..Default::default()
+                };
+                let strict = cast_with_options(&array, &to_type, &strict_options);
+                let first_error = values
+                    .iter()
+                    .flatten()
+                    .find_map(|&v| float_to_decimal::<Decimal128Type>(v, precision, scale).err());
+                match (strict, first_error) {
+                    (Err(actual), Some(expected)) => {
+                        assert_eq!(actual.to_string(), expected.to_string())
+                    }
+                    (Ok(actual), None) => assert_eq!(actual.as_ref(), safe as &dyn Array),
+                    (actual, expected) => panic!("{actual:?} vs {expected:?}"),
+                }
+            }
+        }
     }
 }
