@@ -1898,6 +1898,97 @@ mod tests {
     }
 
     #[test]
+    fn test_float_decimal_array_tails_and_integer_repairs() {
+        fn check<T: ArrowPrimitiveType, D: DecimalType>(array: &PrimitiveArray<T>)
+        where
+            T::Native: AsPrimitive<f64>,
+            D::Native: DecimalCast + NativeFromI64,
+        {
+            for scale in [-23, -22, -2, 0, 2, 15, 22] {
+                if scale > D::MAX_PRECISION as i8 {
+                    continue;
+                }
+                for offset in [0, 1, 9] {
+                    for len in [0, 1, 7, 63, 64, 127] {
+                        let array = array.slice(offset, len);
+                        let precision = D::MAX_PRECISION;
+                        let safe = cast_floating_point_to_decimal::<T, D>(
+                            &array,
+                            precision,
+                            scale,
+                            &CastOptions::default(),
+                        )
+                        .unwrap();
+                        let expected: Vec<_> = array
+                            .iter()
+                            .map(|v| float_to_decimal_opt::<D>(v?.as_(), precision, scale))
+                            .collect();
+                        assert_eq!(
+                            safe.as_primitive::<D>().iter().collect::<Vec<_>>(),
+                            expected
+                        );
+                        let strict = cast_floating_point_to_decimal::<T, D>(
+                            &array,
+                            precision,
+                            scale,
+                            &CastOptions {
+                                safe: false,
+                                ..Default::default()
+                            },
+                        );
+                        let first_error = array.iter().flatten().find_map(|v| {
+                            float_to_decimal_checked::<D>(
+                                v.as_(),
+                                FloatScale::new(scale),
+                                precision,
+                            )
+                            .map_err(|e| e.into_arrow_error(v, precision, scale))
+                            .err()
+                        });
+                        match (strict, first_error) {
+                            (Err(actual), Some(expected)) => {
+                                assert_eq!(actual.to_string(), expected.to_string())
+                            }
+                            (Ok(actual), None) => assert_eq!(actual.as_ref(), safe.as_ref()),
+                            (actual, expected) => panic!("{actual:?} vs {expected:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        let samples = [
+            0.0,
+            -0.0,
+            1.005,
+            -0.145,
+            295161.0,
+            -295161.0,
+            9_007_199_254_740_991.0,
+            9_007_199_254_740_992.0,
+            123.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::MAX,
+        ];
+        let values: Vec<_> = samples.into_iter().cycle().take(140).collect();
+        // Null slots retain nonzero and non-finite payloads; sliced arrays offset the bitmap.
+        let nulls = NullBuffer::new(BooleanBuffer::collect_bool(values.len(), |i| i % 11 != 0));
+        let narrow = Float32Array::new(
+            values.iter().map(|&v| v as f32).collect(),
+            Some(nulls.clone()),
+        );
+        let wide = Float64Array::new(values.into(), Some(nulls));
+        check::<_, Decimal32Type>(&narrow);
+        check::<_, Decimal64Type>(&narrow);
+        check::<_, Decimal128Type>(&narrow);
+        check::<_, Decimal256Type>(&narrow);
+        check::<_, Decimal32Type>(&wide);
+        check::<_, Decimal64Type>(&wide);
+        check::<_, Decimal128Type>(&wide);
+        check::<_, Decimal256Type>(&wide);
+    }
+
+    #[test]
     fn test_low_precision_float_array_boundaries() {
         fn check<D: DecimalType>()
         where
